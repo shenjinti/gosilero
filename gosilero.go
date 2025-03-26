@@ -2,7 +2,7 @@ package gosilero
 
 /*
 #cgo darwin,arm64 LDFLAGS: -L${SRCDIR}/dist -lgosilero_rs -Wl,-rpath,${SRCDIR}/dist
-#cgo linux,amd64 LDFLAGS: -L${SRCDIR}/gosilero-rs/target/x86_64-unknown-linux-gnu/release -lgosilero_rs
+#cgo linux,amd64 LDFLAGS: -L${SRCDIR}/dist -lgosilero_rs
 #include <stdlib.h>
 #include <stdint.h>
 #include "gosilero-rs/gosilero.h"
