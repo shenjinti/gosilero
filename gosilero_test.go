@@ -139,54 +139,6 @@ func TestPredictInt8(t *testing.T) {
 	}
 }
 
-func TestProcessStream(t *testing.T) {
-	vad, err := NewVAD(16000, 512)
-	if err != nil {
-		t.Fatalf("Failed to create VAD: %v", err)
-	}
-	defer vad.Free()
-
-	// Generate a simple sine wave (non-speech)
-	samples := make([]int16, 4096)
-	for i := range samples {
-		samples[i] = int16(math.Sin(float64(i)*0.1) * 32767)
-	}
-
-	// Use a channel to collect results from the callback
-	resultChan := make(chan bool, 10) // Add buffer to avoid blocking
-	callbackCalled := false
-
-	// Define a callback function to process the speech segments
-	callback := func(isSpeech bool, segmentSamples []int16) {
-		if !callbackCalled {
-			callbackCalled = true
-			resultChan <- isSpeech
-		}
-	}
-
-	// Process the stream with a shorter timeout
-	// We're using -1.0 to use the default threshold
-	err = vad.ProcessStream(samples, -1.0, 2, callback)
-	if err != nil {
-		t.Fatalf("Failed to process stream: %v", err)
-	}
-
-	// Wait for the callback to be called with a shorter timeout
-	select {
-	case result := <-resultChan:
-		// Callback completed
-		t.Logf("Got callback result: %v", result)
-	case <-time.After(2 * time.Second): // Shorter timeout
-		t.Fatal("Timed out waiting for stream processing callback")
-	}
-
-	// Test with empty samples
-	err = vad.ProcessStream([]int16{}, -1.0, 2, callback)
-	if err == nil {
-		t.Fatal("Expected error when processing stream with empty samples")
-	}
-}
-
 func TestMultipleCalls(t *testing.T) {
 	vad, err := NewVAD(16000, 512)
 	if err != nil {
@@ -301,7 +253,8 @@ func TestRealVoiceDetection(t *testing.T) {
 
 	t.Logf("Read %d samples", len(samples))
 	t.Logf("Sample value range: Min %d, Max %d", minVal, maxVal)
-	t.Logf("Total duration: %.2f seconds", float64(len(samples))/float64(sampleRate))
+	totalDuration := float64(len(samples)) / float64(sampleRate)
+	t.Logf("Total duration: %.2f seconds", totalDuration)
 
 	// Check if dynamic range is sufficient
 	if maxVal-minVal < 1000 {
@@ -404,102 +357,77 @@ func TestRealVoiceDetection(t *testing.T) {
 		t.Logf("Successfully detected speech segment with highest probability %.4f", maxProb)
 	}
 
-	// 2. Test ProcessStream with our adjusted parameters
-	var speechStartPositions []int
-	var speechEndPositions []int
-	var currentSpeechStart int = -1
-	speechChunks := 0
-	totalChunks := 0
-
-	// 设置一个最大检测位置，确保不会超过文件长度
-	maxPosition := len(samples)
-
-	// Use our custom callback to track speech segments
-	speechCallback := func(isSpeech bool, _ []int16) {
-		currentPosition := totalChunks * options.ChunkSize
-		// 确保位置不超过文件长度
-		if currentPosition > maxPosition {
-			currentPosition = maxPosition
-		}
-
-		currentTime := float64(currentPosition) / float64(sampleRate)
-
-		if isSpeech {
-			speechChunks++
-
-			// Mark start of a new speech segment
-			if currentSpeechStart == -1 {
-				currentSpeechStart = currentPosition
-				t.Logf("Speech starts at %.2f seconds", currentTime)
-			}
-		} else {
-			// If we were in speech and now we're not, record the segment
-			if currentSpeechStart != -1 {
-				endTime := currentTime
-				startTime := float64(currentSpeechStart) / float64(sampleRate)
-				t.Logf("Speech ends at %.2f seconds (duration: %.2f seconds)",
-					endTime, endTime-startTime)
-
-				speechStartPositions = append(speechStartPositions, currentSpeechStart)
-				speechEndPositions = append(speechEndPositions, currentPosition)
-				currentSpeechStart = -1
-			}
-		}
-
-		totalChunks++
-	}
-
-	// Use ProcessStream for detection
-	// Use our lower threshold for better detection
-	err = vad.ProcessStream(samples, options.VoiceThreshold, 0, speechCallback)
+	// 2. Use ProcessStreamDirect to detect speech segments
+	segments, err := vad.ProcessStreamDirect(samples, options.VoiceThreshold)
 	if err != nil {
-		t.Fatalf("Failed to process stream: %v", err)
+		t.Fatalf("Failed to process stream directly: %v", err)
 	}
 
-	// Handle last speech segment if file ends with speech
-	if currentSpeechStart != -1 {
-		speechStartPositions = append(speechStartPositions, currentSpeechStart)
-		// 确保结束位置不超过文件长度
-		endPos := totalChunks * options.ChunkSize
-		if endPos > maxPosition {
-			endPos = maxPosition
+	// Analyze the segments
+	var speechSegments []SpeechSegment
+	for _, segment := range segments {
+		if segment.IsSpeech {
+			speechSegments = append(speechSegments, segment)
 		}
-		speechEndPositions = append(speechEndPositions, endPos)
 	}
 
-	speechRatio := float64(speechChunks) / float64(totalChunks)
-	t.Logf("Detected %d/%d (%.2f%%) blocks containing speech", speechChunks, totalChunks, speechRatio*100)
+	// Group adjacent speech segments
+	type SpeechRange struct {
+		StartPos int
+		EndPos   int
+	}
 
-	// Calculate total duration of the file
-	totalDuration := float64(len(samples)) / float64(sampleRate)
-	t.Logf("Total file duration: %.3f seconds", totalDuration)
+	var speechRanges []SpeechRange
+	if len(speechSegments) > 0 {
+		currentRange := SpeechRange{
+			StartPos: speechSegments[0].StartPos,
+			EndPos:   speechSegments[0].StartPos + options.ChunkSize,
+		}
 
-	// Report detailed information about each speech segment
-	if len(speechStartPositions) > 0 {
-		t.Logf("Detected %d separate speech segments:", len(speechStartPositions))
+		for i := 1; i < len(speechSegments); i++ {
+			// If this segment is adjacent to the current range, extend the range
+			if speechSegments[i].StartPos <= currentRange.EndPos+options.ChunkSize {
+				currentRange.EndPos = speechSegments[i].StartPos + options.ChunkSize
+			} else {
+				// Otherwise, start a new range
+				speechRanges = append(speechRanges, currentRange)
+				currentRange = SpeechRange{
+					StartPos: speechSegments[i].StartPos,
+					EndPos:   speechSegments[i].StartPos + options.ChunkSize,
+				}
+			}
+		}
+		// Add the last range
+		speechRanges = append(speechRanges, currentRange)
+	}
+
+	// Report on the detected ranges
+	if len(speechRanges) > 0 {
+		t.Logf("Detected %d separate speech segments:", len(speechRanges))
 		totalSpeechDuration := 0.0
 		foundExpectedSegment := false
 
-		for i, startPos := range speechStartPositions {
-			endPos := speechEndPositions[i]
-			segmentDuration := float64(endPos-startPos) / float64(sampleRate)
-			startTime := float64(startPos) / float64(sampleRate)
-			endTime := float64(endPos) / float64(sampleRate)
+		for i, rng := range speechRanges {
+			segmentDuration := float64(rng.EndPos-rng.StartPos) / float64(sampleRate)
+			startTime := float64(rng.StartPos) / float64(sampleRate)
+			endTime := float64(rng.EndPos) / float64(sampleRate)
 
 			t.Logf("  Speech segment %d: %.3fs - %.3fs (duration: %.3fs)",
 				i+1, startTime, endTime, segmentDuration)
 
 			// Check if this segment overlaps with our expected segment
 			if startTime <= expectedSpeechEnd && endTime >= expectedSpeechStart {
-				t.Logf("  => This segment overlaps with expected speech at 1.8s-2.3s")
+				t.Logf("  => This segment overlaps with expected speech at %.2fs-%.2fs",
+					expectedSpeechStart, expectedSpeechEnd)
 				foundExpectedSegment = true
 			}
 
 			totalSpeechDuration += segmentDuration
 		}
 
+		speechPercentage := (totalSpeechDuration * 100) / totalDuration
 		t.Logf("Total speech duration: %.3f seconds (%.1f%% of file)",
-			totalSpeechDuration, totalSpeechDuration*100/totalDuration)
+			totalSpeechDuration, speechPercentage)
 
 		if !foundExpectedSegment {
 			t.Errorf("No speech segment detected in the expected range of %.2f-%.2f seconds!",
@@ -507,5 +435,37 @@ func TestRealVoiceDetection(t *testing.T) {
 		}
 	} else {
 		t.Logf("No distinct speech segments detected")
+	}
+}
+
+func TestProcessStreamDirect(t *testing.T) {
+	vad, err := NewVAD(16000, 512)
+	if err != nil {
+		t.Fatalf("Failed to create VAD: %v", err)
+	}
+	defer vad.Free()
+
+	// Generate a simple sine wave (non-speech)
+	samples := make([]int16, 4096)
+	for i := range samples {
+		samples[i] = int16(math.Sin(float64(i)*0.1) * 32767)
+	}
+
+	// Process the stream directly
+	segments, err := vad.ProcessStreamDirect(samples, -1.0)
+	if err != nil {
+		t.Fatalf("Failed to process stream directly: %v", err)
+	}
+
+	// Check that we got some segments
+	t.Logf("Got %d segments", len(segments))
+	for i, segment := range segments {
+		t.Logf("Segment %d: StartPos=%d, IsSpeech=%v", i, segment.StartPos, segment.IsSpeech)
+	}
+
+	// Test with empty samples
+	_, err = vad.ProcessStreamDirect([]int16{}, -1.0)
+	if err == nil {
+		t.Fatal("Expected error when processing stream with empty samples")
 	}
 }

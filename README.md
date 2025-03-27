@@ -7,14 +7,14 @@ Gosilero is a silero-vad library built using Rust, designed to provide efficient
 
 ## build rust project first
 ```shell
-go silero-rs
+cd gosilero-rs
 # build for linux
 cargo build --release --target=x86_64-unknown-linux-gnu
-cp target/x86_64-unknown-linux-gnu/release/libgosilero_rs.so ../dist
+cp target/x86_64-unknown-linux-gnu/release/libgosilero_rs.so ../dist/
 
 # mac
 cargo build --release --target=aarch64-apple-darwin
-cp target/aarch64-apple-darwin/release/libgosilero_rs.dylib ../dist
+cp target/aarch64-apple-darwin/release/libgosilero_rs.dylib ../dist/
 
 ```
 ## build go 
