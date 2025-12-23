@@ -3987,6 +3987,8 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "voice-engine"
 version = "0.3.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93817a5cce04b0bd771df57c85dd620fbb83a4e87b195470d57b2340de117418"
 dependencies = [
  "anyhow",
  "async-stream",
