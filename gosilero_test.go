@@ -42,8 +42,7 @@ func TestNewVAD(t *testing.T) {
 		t.Fatal("Expected error when creating VAD with negative chunk size")
 	}
 
-	// Skip invalid voice threshold test for now as it might be handled differently
-	// in the Rust code than we expected
+	// Skip invalid voice threshold test for now while we settle on the expected error behavior
 }
 
 func TestPredict(t *testing.T) {
@@ -436,4 +435,145 @@ func TestProcessStreamDirect(t *testing.T) {
 	if err == nil {
 		t.Fatal("Expected error when processing stream with empty samples")
 	}
+}
+
+func BenchmarkPredictGoTinySilero(b *testing.B) {
+	vad, err := NewVAD(16000, DefaultChunkSize)
+	if err != nil {
+		b.Fatalf("Failed to create VAD: %v", err)
+	}
+	samples := make([]int16, DefaultChunkSize)
+	for i := range samples {
+		samples[i] = int16(10000.0 * math.Sin(float64(i)*0.1))
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := vad.PredictInt16(samples); err != nil {
+			b.Fatalf("predict failed: %v", err)
+		}
+	}
+}
+
+func TestPerformanceRTF(t *testing.T) {
+	path := "testdata/1843344-user.wav"
+	samples, sampleRate := loadWavSamples(t, path)
+	options := DefaultVADOptions(sampleRate, DefaultChunkSize)
+	vad, err := NewVADWithOptions(options)
+	if err != nil {
+		t.Fatalf("failed to create VAD: %v", err)
+	}
+	defer vad.Free()
+
+	chunkSize := DefaultChunkSize
+	start := time.Now()
+	processedChunks := 0
+	for i := 0; i < len(samples); i += chunkSize {
+		end := i + chunkSize
+		if end > len(samples) {
+			end = len(samples)
+		}
+		if end-i < 100 {
+			continue
+		}
+
+		if _, err := vad.PredictInt16(samples[i:end]); err != nil {
+			t.Fatalf("prediction failed: %v", err)
+		}
+		processedChunks++
+	}
+	elapsed := time.Since(start)
+	duration := float64(len(samples)) / float64(sampleRate)
+	if duration <= 0 {
+		return
+	}
+	rtf := elapsed.Seconds() / duration
+	frameCount := int(math.Ceil(duration / 0.02))
+	if frameCount < 1 {
+		frameCount = 1
+	}
+	singleFrameMs := elapsed.Seconds() * 1000 / float64(frameCount)
+
+	t.Logf("RTF for %s: %.4f (processed %d chunks), %.2fms per 20ms frame", path, rtf, processedChunks, singleFrameMs)
+}
+
+func TestExpectedRanges1843344(t *testing.T) {
+	samples, sampleRate := loadWavSamples(t, "testdata/1843344-user.wav")
+	options := DefaultVADOptions(sampleRate, DefaultChunkSize)
+	options.VoiceThreshold = 0.5
+
+	vad, err := NewVADWithOptions(options)
+	if err != nil {
+		t.Fatalf("Failed to create VAD: %v", err)
+	}
+	defer vad.Free()
+
+	segments, err := vad.ProcessStreamDirect(samples, options.VoiceThreshold)
+	if err != nil {
+		t.Fatalf("Failed to process streamed file: %v", err)
+	}
+
+	expectedRanges := []struct {
+		startMs float64
+		endMs   float64
+	}{
+		{9300, 9800},
+		{14700, 15200},
+		{19200, 19700},
+	}
+
+	chunkMs := float64(options.ChunkSize) * 1000 / float64(sampleRate)
+	found := make([]bool, len(expectedRanges))
+
+	for _, seg := range segments {
+		if !seg.IsSpeech {
+			continue
+		}
+
+		segStartMs := float64(seg.StartPos) * 1000 / float64(sampleRate)
+		segEndMs := segStartMs + chunkMs
+
+		for i, target := range expectedRanges {
+			if found[i] {
+				continue
+			}
+			if segStartMs <= target.endMs && segEndMs >= target.startMs {
+				found[i] = true
+			}
+		}
+	}
+
+	for i, ok := range found {
+		if !ok {
+			t.Fatalf("expected speech near %.0f-%.0fms but did not detect it", expectedRanges[i].startMs, expectedRanges[i].endMs)
+		}
+	}
+}
+
+func loadWavSamples(t *testing.T, path string) ([]int16, int) {
+	t.Helper()
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("unable to open %s: %v", path, err)
+	}
+	defer file.Close()
+
+	reader := wav.NewReader(file)
+	format, err := reader.Format()
+	if err != nil {
+		t.Fatalf("unable to read WAV format: %v", err)
+	}
+
+	var samples []int16
+	for {
+		data, err := reader.ReadSamples()
+		if err != nil || len(data) == 0 {
+			break
+		}
+		for _, d := range data {
+			samples = append(samples, int16(reader.IntValue(d, 0)))
+		}
+	}
+
+	return samples, int(format.SampleRate)
 }

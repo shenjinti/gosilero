@@ -12,25 +12,14 @@ import (
 	"github.com/youpy/go-wav"
 )
 
-// SpeechSegment represents a detected speech segment
-type SpeechSegment struct {
-	Start       float64 `json:"start"`
-	End         float64 `json:"end"`
-	Duration    float64 `json:"duration"`
-	StartFrame  int     `json:"start_frame"`
-	EndFrame    int     `json:"end_frame"`
-	PeakProb    float32 `json:"peak_probability"`
-	PeakProbPos float64 `json:"peak_probability_position"`
-}
-
 // AnalysisResult contains the results of the voice analysis
 type AnalysisResult struct {
-	File             string          `json:"file"`
-	SampleRate       int             `json:"sample_rate"`
-	Duration         float64         `json:"duration"`
-	SpeechDuration   float64         `json:"speech_duration"`
-	SpeechPercentage float64         `json:"speech_percentage"`
-	Segments         []SpeechSegment `json:"segments"`
+	File             string             `json:"file"`
+	SampleRate       int                `json:"sample_rate"`
+	Duration         float64            `json:"duration"`
+	SpeechDuration   float64            `json:"speech_duration"`
+	SpeechPercentage float64            `json:"speech_percentage"`
+	Segments         []gosilero.Segment `json:"segments"`
 }
 
 func main() {
@@ -38,12 +27,13 @@ func main() {
 	wavFile := flag.String("file", "", "Path to WAV file to analyze")
 	sampleRate := flag.Int("sample-rate", 0, "Sample rate override (0 to use file's sample rate)")
 	chunkSize := flag.Int("chunk-size", 512, "Chunk size (512 recommended for 16kHz)")
-	silenceThreshold := flag.Int("silence-ms", 200, "Silence duration threshold (ms)")
-	prePadding := flag.Int("pre-padding-ms", 50, "Pre-speech padding (ms)")
-	postPadding := flag.Int("post-padding-ms", 50, "Post-speech padding (ms)")
-	voiceThreshold := flag.Float64("threshold", 0.6, "Voice activity threshold (0.0-1.0)")
+	silenceThreshold := flag.Int("silence-ms", 100, "Min silence duration (ms)")
+	speechThreshold := flag.Int("speech-ms", 250, "Min speech duration (ms)")
+	prePadding := flag.Int("pre-padding-ms", 30, "Pre-speech padding (ms)")
+	postPadding := flag.Int("post-padding-ms", 30, "Post-speech padding (ms)")
+	voiceThreshold := flag.Float64("threshold", 0.5, "Voice activity threshold (0.0-1.0)")
+	negThreshold := flag.Float64("neg-threshold", 0.35, "Negative threshold (0.0-1.0)")
 	useJson := flag.Bool("json", false, "Output results in JSON format")
-	verboseMode := flag.Bool("verbose", false, "Show detailed probability information for each chunk")
 
 	flag.Parse()
 
@@ -73,6 +63,10 @@ func main() {
 		actualSampleRate = int(format.SampleRate)
 	}
 
+	if *chunkSize != gosilero.DefaultChunkSize {
+		log.Fatalf("chunk size must be %d for the built-in Tiny Silero engine", gosilero.DefaultChunkSize)
+	}
+
 	// Read all audio samples
 	var samples []int16
 	for {
@@ -96,9 +90,11 @@ func main() {
 	// Create VAD with options
 	options := gosilero.DefaultVADOptions(actualSampleRate, *chunkSize)
 	options.SilenceDurationThreshold = time.Duration(*silenceThreshold) * time.Millisecond
+	options.MinSpeechDuration = time.Duration(*speechThreshold) * time.Millisecond
 	options.PreSpeechPadding = time.Duration(*prePadding) * time.Millisecond
 	options.PostSpeechPadding = time.Duration(*postPadding) * time.Millisecond
 	options.VoiceThreshold = float32(*voiceThreshold)
+	options.NegativeThreshold = float32(*negThreshold)
 
 	vad, err := gosilero.NewVADWithOptions(options)
 	if err != nil {
@@ -113,144 +109,16 @@ func main() {
 			format.SampleRate, format.NumChannels, format.BitsPerSample)
 		fmt.Printf("Duration: %.3f seconds, Samples: %d\n",
 			float64(len(samples))/float64(actualSampleRate), len(samples))
-		fmt.Printf("VAD parameters: threshold=%.2f, silence=%dms, pre-padding=%dms, post-padding=%dms\n",
-			*voiceThreshold, *silenceThreshold, *prePadding, *postPadding)
+		fmt.Printf("VAD parameters: threshold=%.2f, neg_threshold=%.2f, silence=%dms, speech=%dms, pre-padding=%dms, post-padding=%dms\n",
+			*voiceThreshold, *negThreshold, *silenceThreshold, *speechThreshold, *prePadding, *postPadding)
 		fmt.Println("\nDetected speech segments:")
 		fmt.Println("-------------------------")
 	}
 
-	// Calculate various parameters
-	silenceDurationSamples := int(float64(*silenceThreshold) * float64(actualSampleRate) / 1000.0)
-	prePaddingSamples := int(float64(*prePadding) * float64(actualSampleRate) / 1000.0)
-	postPaddingSamples := int(float64(*postPadding) * float64(actualSampleRate) / 1000.0)
-
-	// Process the audio in chunks
-	var speechSegments []SpeechSegment
-	var inSpeech bool = false
-	var silenceCount int = 0
-	var currentSegmentStart int = -1
-	var currentSegmentPeakProb float32 = 0.0
-	var currentSegmentPeakPos int = 0
-
-	// Process each chunk
-	for i := 0; i < len(samples); i += *chunkSize {
-		end := i + *chunkSize
-		if end > len(samples) {
-			end = len(samples)
-		}
-
-		// Skip chunks that are too small
-		if end-i < 100 {
-			continue
-		}
-
-		// Get the current chunk
-		chunk := samples[i:end]
-
-		// Predict speech probability
-		prob, err := vad.PredictInt16(chunk)
-		if err != nil {
-			log.Printf("Warning: Failed to predict chunk at %d-%d: %v", i, end, err)
-			continue
-		}
-
-		// Current position in seconds
-		posSeconds := float64(i) / float64(actualSampleRate)
-
-		// Print detailed info if verbose mode is enabled
-		if *verboseMode && !*useJson {
-			fmt.Printf("Chunk %.3fs-%.3fs: probability=%.4f\n",
-				posSeconds,
-				float64(end)/float64(actualSampleRate),
-				prob)
-		}
-
-		// Check if this is speech
-		isSpeech := prob >= float32(*voiceThreshold)
-
-		if isSpeech {
-			// Reset silence counter
-			silenceCount = 0
-
-			// If not already in speech, start a new segment
-			if !inSpeech {
-				inSpeech = true
-
-				// Calculate start with pre-padding
-				start := i - prePaddingSamples
-				if start < 0 {
-					start = 0
-				}
-
-				currentSegmentStart = start
-				currentSegmentPeakProb = prob
-				currentSegmentPeakPos = i
-			}
-
-			// Update peak probability if needed
-			if prob > currentSegmentPeakProb {
-				currentSegmentPeakProb = prob
-				currentSegmentPeakPos = i
-			}
-		} else {
-			// Increment silence counter
-			silenceCount += end - i
-
-			// If we've been in speech and silence is long enough, end the segment
-			if inSpeech && silenceCount >= silenceDurationSamples {
-				inSpeech = false
-
-				// Calculate end with post-padding
-				segmentEnd := i + postPaddingSamples
-				if segmentEnd > len(samples) {
-					segmentEnd = len(samples)
-				}
-
-				// Create segment
-				segmentDuration := float64(segmentEnd-currentSegmentStart) / float64(actualSampleRate)
-				startTime := float64(currentSegmentStart) / float64(actualSampleRate)
-				endTime := float64(segmentEnd) / float64(actualSampleRate)
-				peakProbTime := float64(currentSegmentPeakPos) / float64(actualSampleRate)
-
-				segment := SpeechSegment{
-					Start:       startTime,
-					End:         endTime,
-					Duration:    segmentDuration,
-					StartFrame:  currentSegmentStart,
-					EndFrame:    segmentEnd,
-					PeakProb:    currentSegmentPeakProb,
-					PeakProbPos: peakProbTime,
-				}
-
-				speechSegments = append(speechSegments, segment)
-
-				// Reset peak tracking
-				currentSegmentPeakProb = 0.0
-			}
-		}
-	}
-
-	// Handle speech at the end of the file
-	if inSpeech {
-		segmentEnd := len(samples)
-
-		// Create segment
-		segmentDuration := float64(segmentEnd-currentSegmentStart) / float64(actualSampleRate)
-		startTime := float64(currentSegmentStart) / float64(actualSampleRate)
-		endTime := float64(segmentEnd) / float64(actualSampleRate)
-		peakProbTime := float64(currentSegmentPeakPos) / float64(actualSampleRate)
-
-		segment := SpeechSegment{
-			Start:       startTime,
-			End:         endTime,
-			Duration:    segmentDuration,
-			StartFrame:  currentSegmentStart,
-			EndFrame:    segmentEnd,
-			PeakProb:    currentSegmentPeakProb,
-			PeakProbPos: peakProbTime,
-		}
-
-		speechSegments = append(speechSegments, segment)
+	// Process the audio to get segments
+	speechSegments, err := vad.GetSpeechSegments(samples)
+	if err != nil {
+		log.Fatalf("Error processing audio: %v", err)
 	}
 
 	// Calculate total speech duration

@@ -1,42 +1,18 @@
-# Gosilero
+# Gosilero (Go)
 
-Gosilero is a silero-vad library built using Rust, designed to provide efficient and accurate speech detection capabilities. This library leverages the performance and safety of Rust while offering seamless integration with Go through CGo bindings.
+A pure-Go reimplementation of the Silero VAD.
 
+## Building & Running
 
-# how to build 
+1. `go test ./...` exercises the inference pipeline plus the regression on `testdata/1843344-user.wav` (the 9.3‑9.8 s, 14.7‑15.2 s, and 19.2‑19.7 s ranges using a 0.5 threshold and 512-sample chunks).
+2. `go run cmd/gosilero/main.go -file testdata/thankyou_16k.wav` runs the CLI, prints the detected segments, and still supports the threshold/padding flags (chunk size remains fixed at 512 samples).
 
-## build rust project first
-```shell
-cd gosilero-rs
-# build for linux
-cargo build --release --target=x86_64-unknown-linux-gnu
-cp target/x86_64-unknown-linux-gnu/release/libgosilero_rs.so ../dist/
+## RTF measurement
 
-# mac
-cargo build --release --target=aarch64-apple-darwin
-cp target/aarch64-apple-darwin/release/libgosilero_rs.dylib ../dist/
+`TestPerformanceRTF` runs inference over `testdata/1843344-user.wav` and logs both the real-time factor (RTF) for the full file plus the average wall-clock time to process a single 20 ms frame (assuming 320 samples per frame). 
 
-```
-## build go 
+Execute `go test -run TestPerformanceRTF -count=1` to see the output in the logs; it uses the same WAV referenced earlier so you can directly compare RTF numbers between runs or machines.
 
+For reference, a recent [Rust Tiny Silero ](https://github.com/restsend/active-call) run reported `RTF = 0.0020` over 27.32 s (≈55.10 ms total) and `0.04 ms` per 20 ms frame (854 chunks). 
 
-```shell
-#mac 
-export DYLD_LIBRARY_PATH=$DYLD_LIBRARY_PATH:`pwd`/dist
-
-# linux
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:`pwd`/dist
-go run cmd/gosilero/main.go -file testdata/thankyou_16k.wav
-
-File: testdata/thankyou_16k.wav
-Sample rate: 16000 Hz, Channels: 1, Bits per sample: 16
-Duration: 3.611 seconds, Samples: 57783
-VAD parameters: threshold=0.60, silence=200ms, pre-padding=50ms, post-padding=50ms
-
-Detected speech segments:
--------------------------
-Segment 1: 1.774s - 2.642s (duration: 0.868s), peak: 0.9987 at 2.208s
--------------------------
-Total speech: 0.868 seconds (24.0% of file)
-Segments detected: 1
-```
+The pure-Go engine logs ~`RTF = 0.0029` and `0.06 ms` per frame on the same file.

@@ -1,167 +1,151 @@
 package gosilero
 
-/*
-#cgo darwin,arm64 LDFLAGS: -L${SRCDIR}/dist -lgosilero_rs -Wl,-rpath,${SRCDIR}/dist
-#cgo linux,amd64 LDFLAGS: -L${SRCDIR}/dist -lgosilero_rs
-#include <stdlib.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include "gosilero-rs/gosilero.h"
-
-// Forward declarations for functions that might not be in the header yet
-extern char* gosilero_vad_get_error(struct GosileroVAD* vad);
-extern int gosilero_vad_process_stream_direct(
-    struct GosileroVAD* vad,
-    const int16_t* samples,
-    size_t num_samples,
-    float threshold_override,
-    uint8_t* output_is_speech,
-    size_t* output_positions,
-    size_t output_size,
-    size_t* actual_output_size
-);
-*/
-import "C"
 import (
 	"errors"
-	"runtime"
+	"fmt"
 	"time"
-	"unsafe"
 )
 
-// VAD represents a Voice Activity Detector instance
+// VAD provides a voice activity detector powered by the Tiny Silero model.
 type VAD struct {
-	handle  *C.struct_GosileroVAD
-	options VADOptions // Store options for later use
+	engine   *tinySileroEngine
+	options  VADOptions
+	chunkBuf []float32
 }
 
-// VADOptions contains all configuration options for the VAD
+// VADOptions configures the behavior of predicting speech activity.
 type VADOptions struct {
-	// SampleRate is the audio sample rate in Hz (e.g. 8000, 16000)
-	SampleRate int
-	// ChunkSize is the chunk size to use (recommended: 256, 512, or 768 for 8000Hz; 512, 768, or 1024 for 16000Hz)
-	ChunkSize int
-	// SilenceDurationThreshold is the minimum duration of silence to split speech segments
+	SampleRate               int
+	ChunkSize                int
+	MinSpeechDuration        time.Duration
 	SilenceDurationThreshold time.Duration
-	// PreSpeechPadding is the padding before speech segment
-	PreSpeechPadding time.Duration
-	// PostSpeechPadding is the padding after speech segment
-	PostSpeechPadding time.Duration
-	// VoiceThreshold is the threshold for speech detection (0.0 to 1.0)
-	VoiceThreshold float32
+	PreSpeechPadding         time.Duration
+	PostSpeechPadding        time.Duration
+	VoiceThreshold           float32
+	NegativeThreshold        float32
 }
 
-// DefaultVADOptions returns the default VAD options
+// DefaultVADOptions returns sane defaults for a given sample rate and chunk size.
 func DefaultVADOptions(sampleRate, chunkSize int) VADOptions {
 	return VADOptions{
 		SampleRate:               sampleRate,
 		ChunkSize:                chunkSize,
-		SilenceDurationThreshold: 200 * time.Millisecond,
-		PreSpeechPadding:         50 * time.Millisecond,
-		PostSpeechPadding:        50 * time.Millisecond,
-		VoiceThreshold:           0.6,
+		MinSpeechDuration:        250 * time.Millisecond,
+		SilenceDurationThreshold: 100 * time.Millisecond,
+		PreSpeechPadding:         30 * time.Millisecond,
+		PostSpeechPadding:        30 * time.Millisecond,
+		VoiceThreshold:           0.5,
+		NegativeThreshold:        0.35,
 	}
 }
 
-// NewVAD creates a new Voice Activity Detector with the given parameters
+// NewVAD creates a new detector with the default options for the given sample rate and chunk size.
 func NewVAD(sampleRate, chunkSize int) (*VAD, error) {
 	options := DefaultVADOptions(sampleRate, chunkSize)
 	return NewVADWithOptions(options)
 }
 
-// NewVADWithOptions creates a new Voice Activity Detector with the given options
+// NewVADWithOptions creates a detector configured with specific options.
 func NewVADWithOptions(options VADOptions) (*VAD, error) {
-	result := C.gosilero_vad_new(
-		C.int(options.SampleRate),
-		C.int(options.ChunkSize),
-		C.float(options.VoiceThreshold),
-	)
-	if !bool(result.success) {
-		return nil, getLastError()
+	if options.SampleRate <= 0 || options.ChunkSize <= 0 {
+		return nil, errors.New("sample rate and chunk size must be positive")
+	}
+	if options.ChunkSize != tinyChunkSize {
+		return nil, fmt.Errorf("chunk size must be %d", tinyChunkSize)
+	}
+	if options.VoiceThreshold < 0 || options.VoiceThreshold > 1 {
+		return nil, errors.New("threshold must be between 0 and 1")
 	}
 
-	vad := &VAD{
-		handle:  result.vad,
-		options: options, // Store the options
+	engine, err := newTinySileroEngine()
+	if err != nil {
+		return nil, err
 	}
-	runtime.SetFinalizer(vad, (*VAD).Free)
-	return vad, nil
+
+	return &VAD{
+		engine:   engine,
+		options:  options,
+		chunkBuf: make([]float32, tinyChunkSize),
+	}, nil
 }
 
-// Free releases the resources associated with this VAD
+// Free releases any engine resources. It is safe to call multiple times.
 func (v *VAD) Free() {
-	if v.handle != nil {
-		C.gosilero_vad_free(v.handle)
-		v.handle = nil
+	if v == nil {
+		return
 	}
+	v.engine = nil
+	v.chunkBuf = nil
 }
 
-// Predict determines if the given audio samples contain speech
-// Returns a probability between 0.0 and 1.0
+// Predict returns how likely the provided samples contain speech.
 func (v *VAD) Predict(samples []float32) (float32, error) {
-	if v.handle == nil {
+	if v.engine == nil {
 		return 0, errors.New("VAD has been freed")
 	}
-
 	if len(samples) == 0 {
 		return 0, errors.New("no samples provided")
 	}
 
-	result := C.gosilero_vad_predict(
-		v.handle,
-		(*C.float)(unsafe.Pointer(&samples[0])),
-		C.size_t(len(samples)),
-	)
+	chunk := v.chunkBuf
+	limit := len(chunk)
+	if len(samples) < limit {
+		limit = len(samples)
+	}
 
-	return float32(result), nil
+	copy(chunk, samples[:limit])
+	for i := limit; i < len(chunk); i++ {
+		chunk[i] = 0
+	}
+
+	return v.engine.Predict(chunk), nil
 }
 
-// PredictInt16 determines if the given 16-bit audio samples contain speech
-// Returns a probability between 0.0 and 1.0
+// PredictInt16 is a convenience wrapper converting 16-bit PCM samples to float32.
 func (v *VAD) PredictInt16(samples []int16) (float32, error) {
-	if v.handle == nil {
+	if v.engine == nil {
 		return 0, errors.New("VAD has been freed")
 	}
-
 	if len(samples) == 0 {
 		return 0, errors.New("no samples provided")
 	}
 
-	result := C.gosilero_vad_predict_i16(
-		v.handle,
-		(*C.int16_t)(unsafe.Pointer(&samples[0])),
-		C.size_t(len(samples)),
-	)
+	chunk := v.chunkBuf
+	limit := len(chunk)
+	if len(samples) < limit {
+		limit = len(samples)
+	}
 
-	return float32(result), nil
+	for i := 0; i < limit; i++ {
+		chunk[i] = float32(samples[i]) / 32768.0
+	}
+	for i := limit; i < len(chunk); i++ {
+		chunk[i] = 0
+	}
+
+	return v.engine.Predict(chunk), nil
 }
 
-// SpeechSegment represents a detected speech segment
+// SpeechSegment describes a speech flag for a chunk starting at StartPos.
 type SpeechSegment struct {
-	// Start position in samples
 	StartPos int
-	// IsSpeech indicates if this segment contains speech
 	IsSpeech bool
 }
 
-// ProcessStreamDirect processes a stream of audio samples and returns the detected speech segments directly
-// This avoids the need for callbacks and provides a simpler API
+// ProcessStreamDirect chunks audio according to ChunkSize and returns a boolean vector of speech.
 func (v *VAD) ProcessStreamDirect(samples []int16, threshold float32) ([]SpeechSegment, error) {
-	if v.handle == nil {
+	if v.engine == nil {
 		return nil, errors.New("VAD has been freed")
 	}
-
 	if len(samples) == 0 {
 		return nil, errors.New("no samples provided")
 	}
 
-	// Use the passed threshold if valid, otherwise use the default
 	useThreshold := threshold
-	if threshold < 0 || threshold > 1 {
+	if useThreshold <= 0 || useThreshold > 1 {
 		useThreshold = v.options.VoiceThreshold
 	}
 
-	// Process each chunk of audio and build segments directly
 	chunkSize := v.options.ChunkSize
 	segments := make([]SpeechSegment, 0, len(samples)/chunkSize+1)
 
@@ -170,19 +154,14 @@ func (v *VAD) ProcessStreamDirect(samples []int16, threshold float32) ([]SpeechS
 		if end > len(samples) {
 			end = len(samples)
 		}
-
-		// Skip chunks that are too small
 		if end-i < 100 {
 			continue
 		}
 
-		chunk := samples[i:end]
-		// Call C function directly to avoid lock reentry
-		prob := float32(C.gosilero_vad_predict_i16(
-			v.handle,
-			(*C.int16_t)(unsafe.Pointer(&chunk[0])),
-			C.size_t(len(chunk)),
-		))
+		prob, err := v.PredictInt16(samples[i:end])
+		if err != nil {
+			return nil, err
+		}
 
 		segments = append(segments, SpeechSegment{
 			StartPos: i,
@@ -193,8 +172,156 @@ func (v *VAD) ProcessStreamDirect(samples []int16, threshold float32) ([]SpeechS
 	return segments, nil
 }
 
-// getLastError retrieves the last error from the Rust library
-func getLastError() error {
-	// Return a generic error since we can't access the global error
-	return errors.New("an error occurred while operating on the VAD")
+// Segment represents a detected speech segment with timing information.
+type Segment struct {
+	Start       float64 `json:"start"`
+	End         float64 `json:"end"`
+	Duration    float64 `json:"duration"`
+	StartSample int     `json:"start_sample"`
+	EndSample   int     `json:"end_sample"`
+	PeakProb    float32 `json:"peak_probability"`
+	PeakProbPos float64 `json:"peak_probability_position"`
+}
+
+// Reset clears the internal state of the VAD (LSTM hidden states).
+// Call this between processing different audio streams.
+func (v *VAD) Reset() {
+	if v.engine != nil {
+		v.engine.reset()
+	}
+}
+
+// GetSpeechSegments process the audio and returns continuous speech segments.
+func (v *VAD) GetSpeechSegments(samples []int16) ([]Segment, error) {
+	if v.engine == nil {
+		return nil, errors.New("VAD has been freed")
+	}
+	if len(samples) == 0 {
+		return nil, nil
+	}
+
+	v.Reset() // Always start from a clean state for the whole buffer
+
+	sampleRate := float64(v.options.SampleRate)
+	minSpeechSamples := int(v.options.MinSpeechDuration.Seconds() * sampleRate)
+	minSilenceSamples := int(v.options.SilenceDurationThreshold.Seconds() * sampleRate)
+	prePaddingSamples := int(v.options.PreSpeechPadding.Seconds() * sampleRate)
+	postPaddingSamples := int(v.options.PostSpeechPadding.Seconds() * sampleRate)
+
+	var segments []Segment
+	triggered := false
+	tempEnd := 0
+	currentStart := 0
+	var currentPeakProb float32
+	var currentPeakPos int
+
+	chunkSize := v.options.ChunkSize
+
+	for i := 0; i < len(samples); i += chunkSize {
+		end := i + chunkSize
+		if end > len(samples) {
+			end = len(samples)
+		}
+		if end-i < 100 {
+			continue
+		}
+
+		prob, err := v.PredictInt16(samples[i:end])
+		if err != nil {
+			return nil, err
+		}
+
+		if prob >= v.options.VoiceThreshold && tempEnd != 0 {
+			tempEnd = 0
+		}
+
+		if prob >= v.options.VoiceThreshold {
+			if !triggered {
+				triggered = true
+				currentStart = i
+				currentPeakProb = prob
+				currentPeakPos = i
+			}
+			if prob > currentPeakProb {
+				currentPeakProb = prob
+				currentPeakPos = i
+			}
+		} else if prob < v.options.NegativeThreshold && triggered {
+			if tempEnd == 0 {
+				tempEnd = i
+			}
+
+			if i-tempEnd >= minSilenceSamples {
+				// The actual speech ended at tempEnd
+				if tempEnd-currentStart >= minSpeechSamples {
+					speechEnd := tempEnd + postPaddingSamples
+					if speechEnd > len(samples) {
+						speechEnd = len(samples)
+					}
+
+					actualStart := currentStart - prePaddingSamples
+					if actualStart < 0 {
+						actualStart = 0
+					}
+
+					segment := Segment{
+						Start:       float64(actualStart) / sampleRate,
+						End:         float64(speechEnd) / sampleRate,
+						Duration:    float64(speechEnd-actualStart) / sampleRate,
+						StartSample: actualStart,
+						EndSample:   speechEnd,
+						PeakProb:    currentPeakProb,
+						PeakProbPos: float64(currentPeakPos) / sampleRate,
+					}
+					// Ensure no overlap with previous segment
+					if len(segments) > 0 {
+						prevEnd := segments[len(segments)-1].EndSample
+						if segment.StartSample < prevEnd {
+							segment.StartSample = prevEnd
+							segment.Start = float64(segment.StartSample) / sampleRate
+							segment.Duration = segment.End - segment.Start
+						}
+					}
+					if segment.Duration > 0 {
+						segments = append(segments, segment)
+					}
+				}
+				triggered = false
+				tempEnd = 0
+				currentPeakProb = 0
+			}
+		}
+	}
+
+	if triggered {
+		speechEnd := len(samples)
+		if speechEnd-currentStart >= minSpeechSamples {
+			actualStart := currentStart - prePaddingSamples
+			if actualStart < 0 {
+				actualStart = 0
+			}
+			segment := Segment{
+				Start:       float64(actualStart) / sampleRate,
+				End:         float64(speechEnd) / sampleRate,
+				Duration:    float64(speechEnd-actualStart) / sampleRate,
+				StartSample: actualStart,
+				EndSample:   speechEnd,
+				PeakProb:    currentPeakProb,
+				PeakProbPos: float64(currentPeakPos) / sampleRate,
+			}
+			if len(segments) > 0 {
+				prevEnd := segments[len(segments)-1].EndSample
+				if segment.StartSample < prevEnd {
+					segment.StartSample = prevEnd
+					segment.Start = float64(segment.StartSample) / sampleRate
+					segment.Duration = segment.End - segment.Start
+				}
+			}
+			if segment.Duration > 0 {
+				segments = append(segments, segment)
+			}
+		}
+	}
+
+	return segments, nil
 }

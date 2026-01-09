@@ -1,2 +1,4 @@
 cmd/gosilero/gosilero
 .DS_Store
+*.o
+go.sum
