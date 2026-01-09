@@ -1,15 +1,15 @@
+use active_call::media::vad::VADOption;
 use anyhow::Result;
 use libc::{c_char, c_float, c_int, size_t};
 use std::ffi::CString;
 use std::ptr;
-use voice_engine::media::vad::VADOption;
 pub struct VoiceActivityDetector {
-    session: voice_engine::media::vad::TinySilero,
+    session: active_call::media::vad::TinySilero,
 }
 
 impl VoiceActivityDetector {
     pub fn new(config: VADOption) -> Result<Self> {
-        let session = voice_engine::media::vad::TinySilero::new(config)?;
+        let session = active_call::media::vad::TinySilero::new(config)?;
         Ok(VoiceActivityDetector { session })
     }
 

@@ -242,8 +242,7 @@ func TestRealVoiceDetection(t *testing.T) {
 
 	// Create VAD instance with custom options
 	options := DefaultVADOptions(sampleRate, 512)
-	// 不再覆盖默认值，除了略微降低阈值以确保检测到较弱的信号
-	options.VoiceThreshold = 0.3 // 比默认的0.6略低，以确保能捕获到预期的语音段落
+	options.VoiceThreshold = 0.3
 
 	vad, err := NewVADWithOptions(options)
 	if err != nil {
