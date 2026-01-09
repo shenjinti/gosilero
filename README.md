@@ -16,3 +16,14 @@ Execute `go test -run TestPerformanceRTF -count=1` to see the output in the logs
 For reference, a recent [Rust Tiny Silero ](https://github.com/restsend/active-call) run reported `RTF = 0.001` and `0.03 ms` per 20 ms frame. 
 
 The pure-Go engine logs ~`RTF = 0.0029` and `0.06 ms` per frame on the same file.
+
+## VAD Performance
+
+Benchmarked on 60 seconds of 16kHz audio (Release mode):
+
+| VAD Engine | Implementation | Time (60s) | RTF (Ratio) | Note |
+|------------|----------------|------------|-------------|------|
+| **gosilero** | Go | ~175.0 ms | 0.0029 | Slower (Not SIMD), Pure GO |
+| **TinySilero** | Rust (Optimized) | ~60.0 ms | 0.0010 | >2.5x faster than ONNX |
+| **ONNX Silero** | ONNX Runtime | ~158.3 ms | 0.0026 | Standard baseline |
+| **WebRTC VAD** | C/C++ (Bind) | ~3.1 ms | 0.00005 | Legacy, less accurate |
