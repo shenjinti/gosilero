@@ -13,7 +13,6 @@ A pure-Go reimplementation of the Silero VAD.
 
 Execute `go test -run TestPerformanceRTF -count=1` to see the output in the logs; it uses the same WAV referenced earlier so you can directly compare RTF numbers between runs or machines.
 
+For reference, a recent [Rust Tiny Silero ](https://github.com/restsend/active-call) run reported `RTF = 0.001` and `0.03 ms` per 20 ms frame. 
 
-For reference, a recent [Rust Tiny Silero ](https://github.com/restsend/active-call) run reported `RTF = 0.0009`. 
-
-The pure-Go engine logs ~`RTF = 0.0042` and `0.08 ms` per frame on the same file.
+The pure-Go engine logs ~`RTF = 0.0029` and `0.06 ms` per frame on the same file.
