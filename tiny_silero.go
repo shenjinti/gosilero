@@ -11,6 +11,8 @@ import (
 const (
 	tinyChunkSize    = 512
 	DefaultChunkSize = tinyChunkSize
+	contextSize      = 64
+	stftPadding      = 64
 	stftWindowSize   = 256
 	stftStride       = 128
 	freqBins         = stftWindowSize/2 + 1
@@ -232,10 +234,10 @@ func getSharedModel() (*tinySileroModel, error) {
 		window:        generateHannWindow(stftWindowSize),
 		fftBitReverse: makeBitReverse(stftWindowSize),
 
-		enc0: newConv1dLayer(freqBins, 128, 3, 1, 1, true),
-		enc1: newConv1dLayer(128, 64, 3, 2, 1, true),
-		enc2: newConv1dLayer(64, 64, 3, 2, 1, true),
-		enc3: newConv1dLayer(64, 128, 3, 1, 1, true),
+		enc0: newConv1dLayer(freqBins, 128, 3, 1, 1, true), // stride=1
+		enc1: newConv1dLayer(128, 64, 3, 2, 1, true),       // stride=2 (fixed)
+		enc2: newConv1dLayer(64, 64, 3, 2, 1, true),        // stride=2
+		enc3: newConv1dLayer(64, 128, 3, 1, 1, true),       // stride=1 (fixed)
 		out:  newConv1dLayer(128, 1, 1, 1, 0, false),
 	}
 
@@ -250,17 +252,20 @@ func getSharedModel() (*tinySileroModel, error) {
 type tinySileroEngine struct {
 	model *tinySileroModel
 
-	fftInput   []complex64
-	bufMag     []float32
-	bufEnc0Out []float32
-	bufEnc1Out []float32
-	bufEnc2Out []float32
-	bufEnc3Out []float32
-	bufGates   []float32
-	lstmInput  []float32
-	h          []float32
-	c          []float32
-	scratchPad []float32
+	fftInput       []complex64
+	bufMag         []float32
+	bufEnc0Out     []float32
+	bufEnc1Out     []float32
+	bufEnc2Out     []float32
+	bufEnc3Out     []float32
+	bufGates       []float32
+	lstmInput      []float32
+	h              []float32
+	c              []float32
+	scratchPad     []float32
+	bufContext     []float32
+	bufWithContext []float32
+	bufPadded      []float32
 }
 
 func newTinySileroEngine() (*tinySileroEngine, error) {
@@ -270,18 +275,21 @@ func newTinySileroEngine() (*tinySileroEngine, error) {
 	}
 
 	engine := &tinySileroEngine{
-		model:      model,
-		fftInput:   make([]complex64, stftWindowSize),
-		bufMag:     make([]float32, freqBins*3),
-		bufEnc0Out: make([]float32, 128*3),
-		bufEnc1Out: make([]float32, 64*2),
-		bufEnc2Out: make([]float32, 64*1),
-		bufEnc3Out: make([]float32, 128*1),
-		bufGates:   make([]float32, 4*lstmHiddenSize),
-		lstmInput:  make([]float32, lstmHiddenSize),
-		h:          make([]float32, lstmHiddenSize),
-		c:          make([]float32, lstmHiddenSize),
-		scratchPad: make([]float32, 1024), // Large enough for any layer padBuf
+		model:          model,
+		fftInput:       make([]complex64, stftWindowSize),
+		bufMag:         make([]float32, freqBins*4), // 4 frames instead of 3
+		bufEnc0Out:     make([]float32, 128*4),      // stride=1: 4->4
+		bufEnc1Out:     make([]float32, 64*2),       // stride=2: 4->2
+		bufEnc2Out:     make([]float32, 64*1),       // stride=2: 2->1
+		bufEnc3Out:     make([]float32, 128*1),      // stride=1: 1->1
+		bufGates:       make([]float32, 4*lstmHiddenSize),
+		lstmInput:      make([]float32, lstmHiddenSize),
+		h:              make([]float32, lstmHiddenSize),
+		c:              make([]float32, lstmHiddenSize),
+		scratchPad:     make([]float32, 1024), // Large enough for any layer padBuf
+		bufContext:     make([]float32, contextSize),
+		bufWithContext: make([]float32, contextSize+tinyChunkSize),
+		bufPadded:      make([]float32, contextSize+tinyChunkSize+stftPadding),
 	}
 
 	return engine, nil
@@ -321,28 +329,42 @@ func (m *tinySileroModel) loadWeights(data []byte) error {
 			return err
 		}
 
-		// Directly read into LSTM buffers if they don't need transformation
 		var target *[]float32
+		needsTransform := false
 		switch name {
-		case "lstm_w_ih":
+		case "lstm0_w_ih":
 			target = &m.lstmWIH
-		case "lstm_w_hh":
+			needsTransform = true
+		case "lstm0_w_hh":
 			target = &m.lstmWHH
-		case "lstm_b_ih":
+			needsTransform = true
+		case "lstm0_b_ih":
 			target = &m.lstmBIH
-		case "lstm_b_hh":
+		case "lstm0_b_hh":
 			target = &m.lstmBHH
 		}
 
 		if target != nil {
-			*target, err = reader.readFloat32s(int(dataLen), *target)
+			tmpFloats, err = reader.readFloat32s(int(dataLen), tmpFloats)
 			if err != nil {
 				return err
+			}
+
+			if needsTransform {
+				h := lstmHiddenSize
+				transformed := make([]float32, len(tmpFloats))
+				for i := 0; i < 4*h; i++ {
+					for j := 0; j < h; j++ {
+						transformed[j*4*h+i] = tmpFloats[i*h+j]
+					}
+				}
+				*target = transformed
+			} else {
+				*target = append((*target)[:0], tmpFloats...)
 			}
 			continue
 		}
 
-		// Others use temporary buffer
 		tmpFloats, err = reader.readFloat32s(int(dataLen), tmpFloats)
 		if err != nil {
 			return err
@@ -542,6 +564,9 @@ func (e *tinySileroEngine) reset() {
 		e.h[i] = 0
 		e.c[i] = 0
 	}
+	for i := range e.bufContext {
+		e.bufContext[i] = 0
+	}
 }
 
 func (e *tinySileroEngine) Predict(audio []float32) float32 {
@@ -550,28 +575,43 @@ func (e *tinySileroEngine) Predict(audio []float32) float32 {
 	}
 
 	model := e.model
-	for frame := 0; frame < 3; frame++ {
+
+	copy(e.bufWithContext[:contextSize], e.bufContext)
+	copy(e.bufWithContext[contextSize:], audio[:tinyChunkSize])
+
+	inputLen := contextSize + tinyChunkSize // 576
+	copy(e.bufPadded[:inputLen], e.bufWithContext)
+
+	for i := 0; i < stftPadding; i++ {
+		srcIdx := inputLen - 2 - i // -2 to skip the last element and go backwards
+		e.bufPadded[inputLen+i] = e.bufWithContext[srcIdx]
+	}
+
+	for frame := 0; frame < 4; frame++ {
 		start := frame * stftStride
 		input := e.fftInput
 		win := model.window
 
 		for i := 0; i < stftWindowSize; i += 4 {
-			input[i] = complex(audio[start+i]*win[i], 0)
-			input[i+1] = complex(audio[start+i+1]*win[i+1], 0)
-			input[i+2] = complex(audio[start+i+2]*win[i+2], 0)
-			input[i+3] = complex(audio[start+i+3]*win[i+3], 0)
+			input[i] = complex(e.bufPadded[start+i]*win[i], 0)
+			input[i+1] = complex(e.bufPadded[start+i+1]*win[i+1], 0)
+			input[i+2] = complex(e.bufPadded[start+i+2]*win[i+2], 0)
+			input[i+3] = complex(e.bufPadded[start+i+3]*win[i+3], 0)
 		}
 		fftInPlace(e.fftInput, model.fftBitReverse)
 		for bin := 0; bin < freqBins; bin++ {
 			c := e.fftInput[bin]
 			re := real(c)
 			im := imag(c)
-			e.bufMag[bin*3+frame] = float32(math.Sqrt(float64(re*re + im*im)))
+			e.bufMag[bin*4+frame] = float32(math.Sqrt(float64(re*re + im*im)))
 		}
 	}
 
-	model.enc0.forward(e.bufMag, 3, e.bufEnc0Out, e.scratchPad)
-	model.enc1.forward(e.bufEnc0Out, 3, e.bufEnc1Out, e.scratchPad)
+	// Save last 64 samples of current chunk as context for next chunk
+	copy(e.bufContext, audio[tinyChunkSize-contextSize:tinyChunkSize])
+
+	model.enc0.forward(e.bufMag, 4, e.bufEnc0Out, e.scratchPad)
+	model.enc1.forward(e.bufEnc0Out, 4, e.bufEnc1Out, e.scratchPad)
 	model.enc2.forward(e.bufEnc1Out, 2, e.bufEnc2Out, e.scratchPad)
 	model.enc3.forward(e.bufEnc2Out, 1, e.bufEnc3Out, e.scratchPad)
 
@@ -586,37 +626,42 @@ func (e *tinySileroEngine) Predict(audio []float32) float32 {
 	h := e.h
 	gates := e.bufGates
 
-	for i := 0; i < H; i++ {
-		sumI := bih[i] + bhh[i]
-		sumF := bih[i+H] + bhh[i+H]
-		sumG := bih[i+2*H] + bhh[i+2*H]
-		sumO := bih[i+3*H] + bhh[i+3*H]
-
-		offI := i * H
-		offF := (i + H) * H
-		offG := (i + 2*H) * H
-		offO := (i + 3*H) * H
-
-		// Unrolled inner loop for better instruction density
-		for j := 0; j < H; j++ {
-			x := input[j]
-			y := h[j]
-			sumI += wih[offI+j]*x + whh[offI+j]*y
-			sumF += wih[offF+j]*x + whh[offF+j]*y
-			sumG += wih[offG+j]*x + whh[offG+j]*y
-			sumO += wih[offO+j]*x + whh[offO+j]*y
-		}
-		gates[i] = sumI
-		gates[i+H] = sumF
-		gates[i+2*H] = sumG
-		gates[i+3*H] = sumO
+	// Initialize gates with bias
+	copy(gates, bih)
+	for i := 0; i < 4*H; i++ {
+		gates[i] += bhh[i]
 	}
 
+	// Apply W_ih (Layout: [H, 4*H]) - Broadcasting input x
 	for j := 0; j < H; j++ {
-		iGate := sigmoid(e.bufGates[j])
-		fGate := sigmoid(e.bufGates[lstmHiddenSize+j])
-		gGate := tanh32(e.bufGates[2*lstmHiddenSize+j])
-		oGate := sigmoid(e.bufGates[3*lstmHiddenSize+j])
+		x := input[j]
+		if x == 0 {
+			continue
+		}
+		wStart := j * 4 * H
+		for i := 0; i < 4*H; i++ {
+			gates[i] += wih[wStart+i] * x
+		}
+	}
+
+	// Apply W_hh (Layout: [H, 4*H]) - Broadcasting hidden state h
+	for j := 0; j < H; j++ {
+		hVal := h[j]
+		if hVal == 0 {
+			continue
+		}
+		wStart := j * 4 * H
+		for i := 0; i < 4*H; i++ {
+			gates[i] += whh[wStart+i] * hVal
+		}
+	}
+
+	// CRITICAL: Gate order is IFGO (PyTorch standard)
+	for j := 0; j < H; j++ {
+		iGate := sigmoid(gates[0*H+j]) // Position 0: I (Input)
+		fGate := sigmoid(gates[1*H+j]) // Position 1: F (Forget)
+		gGate := tanh32(gates[2*H+j])  // Position 2: G (Cell/Gate)
+		oGate := sigmoid(gates[3*H+j]) // Position 3: O (Output)
 
 		cNew := fGate*e.c[j] + iGate*gGate
 		e.c[j] = cNew
